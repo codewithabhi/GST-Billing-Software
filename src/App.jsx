@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo, lazy, Suspense } from 'react';
-import { Home, FileText, Settings, Plus, Users, Package, BarChart3, Wallet, RefreshCw, Receipt, BookOpen, Moon, Sun, Download, X, ShoppingCart, ChevronDown, Building2, Pencil, HelpCircle, Search, Command, Bell, Calculator, HardDrive, Menu, Heart } from 'lucide-react';
+import { Home, FileText, Settings, Plus, Users, Package, BarChart3, Wallet, RefreshCw, Receipt, BookOpen, Moon, Sun, Download, X, ShoppingCart, ChevronDown, Building2, Pencil, HelpCircle, Search, Command, Bell, Calculator, HardDrive, Menu, Heart, UserRoundPlus, LogOut } from 'lucide-react';
 import { getAllProfiles, saveProfile, getEnabledModules, getAllBills, getAllProducts, getStockAlertSettings, getAllClients, runUpdateNow, getLockStatus } from './store';
 import { isModuleEnabled, getUpcomingFilings, countsAsSales, localToday, toLocalIsoDate, DOCS_URL } from './utils';
 // v1.10.4 — Route-level lazy loading. Prior App.jsx synchronously
@@ -33,6 +33,7 @@ const GSTReturns = lazy(() => import('./components/GSTReturns'));
 const IncomeTax = lazy(() => import('./components/IncomeTax'));
 const PurchaseBills = lazy(() => import('./components/PurchaseBills'));
 const ControlPanel = lazy(() => import('./components/ControlPanel'));
+const BusinessUsersView = lazy(() => import('./components/BusinessUsersView'));
 const SupportView = lazy(() => import('./components/SupportView'));
 import StarBanner from './components/StarBanner';
 import AppFooter from './components/AppFooter';
@@ -72,7 +73,7 @@ function App() {
       const params = new URLSearchParams(window.location.search);
       const v = params.get('view');
       // v1.10.74 - 'controlpanel' added so ?view=controlpanel deep links work too.
-      const valid = ['dashboard', 'new', 'clients', 'inventory', 'expenses', 'purchases', 'recurring', 'receipts', 'reports', 'filing', 'incometax', 'settings', 'controlpanel', 'support'];
+      const valid = ['dashboard', 'new', 'clients', 'inventory', 'expenses', 'purchases', 'recurring', 'receipts', 'reports', 'filing', 'incometax', 'team', 'settings', 'controlpanel', 'support'];
       if (v && valid.includes(v)) {
         // Strip the query string so a refresh doesn't keep snapping back to
         // the shortcut target — only the *first* navigation honours it.
@@ -82,7 +83,8 @@ function App() {
     } catch { /* sandboxed history API — fall through */ }
     // 'guide' was the built-in User Guide (removed in v1.10.75).
     const last = sessionStorage.getItem('gst_currentView');
-    return last && last !== 'guide' ? last : 'dashboard';
+    const role = localStorage.getItem('gst_auth_role') || 'staff';
+    return last && last !== 'guide' && !(last === 'team' && !['owner', 'admin'].includes(role)) ? last : 'dashboard';
   });
   const [profile, setProfile] = useState(null);
   const [editingBill, setEditingBill] = useState(() => {
@@ -105,6 +107,8 @@ function App() {
   const [allProfiles, setAllProfiles] = useState([]);
   const [showProfileMenu, setShowProfileMenu] = useState(false);
   const profileMenuRef = useRef(null);
+  const [authRole, setAuthRole] = useState(() => localStorage.getItem('gst_auth_role') || 'staff');
+  const canManageTeam = authRole === 'owner' || authRole === 'admin';
 
   // Update notification state. Auto-checks GitHub on mount + every 6h.
   // The user can dismiss a specific version (stored in localStorage) so the
@@ -313,7 +317,24 @@ function App() {
 
     const checkServer = async () => {
       try {
-        const res = await fetch('/api/profile', { signal: AbortSignal.timeout(8000) });
+        const token = localStorage.getItem('gst_auth_token') || '';
+        const businessId = localStorage.getItem('gst_activeBusinessId') || '';
+        const res = await fetch('/api/profile', {
+          signal: AbortSignal.timeout(8000),
+          headers: {
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            ...(businessId ? { 'X-Business-Id': businessId } : {}),
+          },
+        });
+        if (res.status === 401 || res.status === 403) {
+          // The backend is reachable, but this browser session is no longer
+          // authenticated or its business membership is invalid. Let AuthGate
+          // show the login screen instead of misreporting this as server-down.
+          localStorage.removeItem('gst_auth_token');
+          localStorage.removeItem('gst_auth_user');
+          window.location.reload();
+          return;
+        }
         if (res.ok) {
           if (cancelled) return;
           misses = 0;
@@ -413,10 +434,25 @@ function App() {
 
   const handleSwitchProfile = async (bp) => {
     setShowProfileMenu(false);
+    if (bp?.id) localStorage.setItem('gst_activeBusinessId', bp.id);
+    try {
+      const memberships = JSON.parse(localStorage.getItem('gst_auth_memberships') || '[]');
+      const role = memberships.find(item => item.businessId === bp?.id)?.role || 'staff';
+      localStorage.setItem('gst_auth_role', role);
+      setAuthRole(role);
+      if (role !== 'owner' && role !== 'admin' && currentView === 'team') setCurrentView('dashboard');
+    } catch { setAuthRole('staff'); }
     const loaded = { ...bp };
     delete loaded.id;
     await saveProfile(loaded);
     setProfile(loaded);
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('gst_auth_token');
+    localStorage.removeItem('gst_auth_user');
+    localStorage.removeItem('gst_activeBusinessId');
+    window.location.reload();
   };
 
   // v1.10.66 (#64 item 1) — identifies the active business for the screens
@@ -525,8 +561,13 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentView, JSON.stringify(enabledModules)]);
 
+  useEffect(() => {
+    if (!canManageTeam && currentView === 'team') setCurrentView('dashboard');
+  }, [canManageTeam, currentView]);
+
   const navItems = [
     { id: 'dashboard', icon: Home, label: 'Dashboard', module: 'dashboard' },
+    { id: 'team', icon: UserRoundPlus, label: 'Team & Access', module: 'dashboard' },
     { id: 'new', icon: Plus, label: 'New Invoice', onClick: handleNewInvoice, module: 'invoicing' },
     { id: 'clients', icon: Users, label: 'Clients', module: 'clients' },
     { id: 'inventory', icon: Package, label: 'Products', module: 'inventory' },
@@ -540,7 +581,7 @@ function App() {
     // v1.10.75 - opens the online documentation, which covers every screen
     // and stays current; the old built-in guide had fallen far behind.
     { id: 'guide', icon: HelpCircle, label: 'User Guide', module: 'dashboard', onClick: openDocs }, // gated by dashboard so it's always available
-  ].filter(item => showIfModule(item.module));
+  ].filter(item => showIfModule(item.module) && (item.id !== 'team' || canManageTeam));
 
   // Command palette actions — declared here (not earlier) because the deps
   // array references `navItems` and `handleNewInvoice`, which are consts.
@@ -557,6 +598,7 @@ function App() {
     acts.push({ label: 'Go to Settings', hint: '', category: 'nav', run: () => setCurrentView('settings') });
     // v1.10.74 - Control Panel has its own sidebar button but was missing here.
     acts.push({ label: 'Go to Control Panel', hint: '', category: 'nav', run: () => setCurrentView('controlpanel') });
+    acts.push({ label: 'Go to Team & Access', hint: '', category: 'nav', run: () => setCurrentView('team') });
     acts.push({ label: 'Go to Support & About', hint: '', category: 'nav', run: () => setCurrentView('support') });
     acts.push({ label: 'Toggle dark mode', hint: '', category: 'action', run: () => setDarkMode(d => !d) });
     acts.push({ label: 'Show keyboard shortcuts', hint: 'Ctrl+/', category: 'help', run: () => setShowShortcutsHelp(true) });
@@ -972,6 +1014,9 @@ function App() {
                 }} title="Update available" />
               )}
             </button>
+            <button className="nav-btn" onClick={handleLogout} title="Sign out of this workspace">
+              <LogOut size={18} /> Sign out
+            </button>
             <div className={`server-status server-status-${serverStatus}`}>
               <span className="server-status-dot" />
               {serverStatus === 'online' ? 'App Ready' : serverStatus === 'offline' ? 'App Not Running' : 'Connecting...'}
@@ -1042,6 +1087,9 @@ function App() {
         )}
         {currentView === 'controlpanel' && (
           <ControlPanel />
+        )}
+        {currentView === 'team' && (
+          <BusinessUsersView />
         )}
         {currentView === 'support' && (
           <SupportView />

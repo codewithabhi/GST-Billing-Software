@@ -6,6 +6,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { AsyncLocalStorage } from 'async_hooks';
 // v1.10.31 — Data-F3.1: share computeInvoiceTotals with the client so
 // server-generated recurring invoices honour UTGST, cess, RCM, TDS/TCS,
 // discount modes (percent / unit / with-tax), tax-inclusive back-calc,
@@ -16,6 +17,10 @@ import { templateTotals, clientYearToDate, nextCounterValue, startFor, numberSer
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, 'data');
+const AUTH_SECRET_PATH = path.join(DATA_DIR, 'auth-secret.json');
+const AUTH_TOKEN_TTL_SECONDS = 12 * 60 * 60;
+const tenantContext = new AsyncLocalStorage();
+const TENANT_DIRS = new Set(['bills', 'clients', 'templates', 'products', 'expenses', 'recurring', 'receipts', 'profiles', 'purchases', 'business-users']);
 
 // Port choice — we deliberately default to a high, unusual number rather than
 // the conventional 3001. The 3000-range is heavily used by every other Node /
@@ -90,11 +95,13 @@ app.use((req, res, next) => {
 });
 
 // Ensure data directory and sub-directories exist
-const DIRS = ['bills', 'clients', 'templates', 'products', 'expenses', 'recurring', 'receipts', 'profiles', 'purchases'];
+const DIRS = ['bills', 'clients', 'templates', 'products', 'expenses', 'recurring', 'receipts', 'profiles', 'purchases', 'business-users', 'users'];
 for (const dir of DIRS) {
   const dirPath = path.join(DATA_DIR, dir);
   if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
 }
+const BUSINESS_META_DIR = path.join(DATA_DIR, 'business-meta');
+if (!fs.existsSync(BUSINESS_META_DIR)) fs.mkdirSync(BUSINESS_META_DIR, { recursive: true });
 
 // Helper: safe filename from ID (replace slashes, etc.)
 function safeFileName(id) {
@@ -181,18 +188,29 @@ function invalidateCache(dir) { delete dirCache[dir]; }
 // Helper: read all JSON files from a directory (cached, 5s TTL)
 function readAllFromDir(dir) {
   const entry = dirCache[dir];
-  if (entry && (Date.now() - entry.at) < DIR_CACHE_TTL_MS) return entry.value;
-  const dirPath = path.join(DATA_DIR, dir);
-  if (!fs.existsSync(dirPath)) return [];
-  const results = fs.readdirSync(dirPath)
-    .filter(f => f.endsWith('.json'))
-    .map(f => {
-      try { return JSON.parse(fs.readFileSync(path.join(dirPath, f), 'utf-8')); }
-      catch { return null; }
-    })
-    .filter(Boolean);
-  dirCache[dir] = { at: Date.now(), value: results };
-  return results;
+  let results;
+  if (entry && (Date.now() - entry.at) < DIR_CACHE_TTL_MS) {
+    results = entry.value;
+  } else {
+    const dirPath = path.join(DATA_DIR, dir);
+    if (!fs.existsSync(dirPath)) return [];
+    results = fs.readdirSync(dirPath)
+      .filter(f => f.endsWith('.json'))
+      .map(f => {
+        try { return JSON.parse(fs.readFileSync(path.join(dirPath, f), 'utf-8')); }
+        catch { return null; }
+      })
+      .filter(Boolean);
+    dirCache[dir] = { at: Date.now(), value: results };
+  }
+  const tenantId = tenantContext.getStore()?.tenantId;
+  return tenantId && TENANT_DIRS.has(dir)
+    ? results.filter(item => item.businessId === tenantId)
+    : results;
+}
+
+function readAllRawFromDir(dir) {
+  return tenantContext.run(undefined, () => readAllFromDir(dir));
 }
 
 // Helper: read a single JSON file
@@ -207,7 +225,18 @@ function readJSON(filePath, fallback = null) {
 // atomically via temp+rename so a crash mid-write can't leave a
 // truncated meta.json that resets the invoice counter.
 function writeJSON(filePath, data) {
-  writeFileAtomic(filePath, JSON.stringify(data, null, 2));
+  const dir = path.basename(path.dirname(filePath));
+  const tenantId = tenantContext.getStore()?.tenantId;
+  const existing = fs.existsSync(filePath) ? readJSON(filePath) : null;
+  if (tenantId && TENANT_DIRS.has(dir) && existing?.businessId && existing.businessId !== tenantId) {
+    const error = new Error('Resource belongs to another business');
+    error.status = 403;
+    throw error;
+  }
+  const value = tenantId && TENANT_DIRS.has(dir) && data && typeof data === 'object' && !Array.isArray(data)
+    ? { ...data, businessId: tenantId }
+    : data;
+  writeFileAtomic(filePath, JSON.stringify(value, null, 2));
   // Invalidate cache for the parent directory
   const parentDir = path.basename(path.dirname(filePath));
   if (DIRS.includes(parentDir)) invalidateCache(parentDir);
@@ -215,10 +244,173 @@ function writeJSON(filePath, data) {
 
 // Helper: delete file (with cache invalidation)
 function deleteFile(filePath) {
+  const current = readJSON(filePath);
+  const tenantId = tenantContext.getStore()?.tenantId;
+  if (tenantId && current?.businessId !== tenantId) return false;
   if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   const parentDir = path.basename(path.dirname(filePath));
   if (DIRS.includes(parentDir)) invalidateCache(parentDir);
+  return true;
 }
+
+function tenantOwnsFile(filePath) {
+  const tenantId = tenantContext.getStore()?.tenantId;
+  if (!tenantId) return true;
+  const current = readJSON(filePath);
+  return current?.businessId === tenantId;
+}
+
+// ========================
+// AUTHENTICATION / TENANCY
+// ========================
+function getAuthSecret() {
+  let record = readJSON(AUTH_SECRET_PATH);
+  if (!record?.secret) {
+    record = { secret: crypto.randomBytes(48).toString('base64url'), createdAt: new Date().toISOString() };
+    writeFileAtomic(AUTH_SECRET_PATH, JSON.stringify(record, null, 2));
+  }
+  return record.secret;
+}
+
+function encodeToken(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = crypto.createHmac('sha256', getAuthSecret()).update(body).digest('base64url');
+  return `${body}.${signature}`;
+}
+
+function decodeToken(token) {
+  try {
+    const [body, signature] = String(token || '').split('.');
+    if (!body || !signature) return null;
+    const expected = crypto.createHmac('sha256', getAuthSecret()).update(body).digest('base64url');
+    if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    return payload.exp > Math.floor(Date.now() / 1000) ? payload : null;
+  } catch { return null; }
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  return new Promise((resolve, reject) => crypto.scrypt(String(password), salt, 64, (error, derived) => {
+    if (error) reject(error);
+    else resolve(`${salt}:${derived.toString('hex')}`);
+  }));
+}
+
+async function verifyPassword(password, stored) {
+  const [salt, expectedHex] = String(stored || '').split(':');
+  if (!salt || !expectedHex) return false;
+  const actual = await hashPassword(password, salt);
+  return crypto.timingSafeEqual(Buffer.from(actual.split(':')[1], 'hex'), Buffer.from(expectedHex, 'hex'));
+}
+
+function authUserById(id) {
+  return readAllRawFromDir('users').find(user => user.id === id) || null;
+}
+
+function authMemberships(userId) {
+  return readAllRawFromDir('business-users').filter(member => member.userId === userId && member.status !== 'suspended');
+}
+
+function authBusinessesFor(userId) {
+  const ids = new Set(authMemberships(userId).map(member => member.businessId));
+  return readAllRawFromDir('profiles').filter(profile => ids.has(profile.id) || ids.has(profile.businessId));
+}
+
+function authFromRequest(req) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const payload = decodeToken(token);
+  if (!payload?.sub) return null;
+  const user = authUserById(payload.sub);
+  if (!user) return null;
+  return { id: user.id, name: user.name, email: user.email, role: user.role || 'user' };
+}
+
+function requireAuth(req, res, next) {
+  const auth = authFromRequest(req);
+  if (!auth) return res.status(401).json({ error: 'Authentication required', code: 'auth-required' });
+  const memberships = authMemberships(auth.id);
+  if (!memberships.length) return res.status(403).json({ error: 'No business access', code: 'no-business-access' });
+  const requested = String(req.headers['x-business-id'] || '').trim();
+  const membership = memberships.find(item => item.businessId === requested) || memberships[0];
+  return tenantContext.run({ tenantId: membership.businessId, auth }, () => {
+    req.auth = auth;
+    req.tenantId = membership.businessId;
+    req.membership = membership;
+    next();
+  });
+}
+
+function addBusinessMembership(userId, businessId, role = 'staff') {
+  const id = `bu_${crypto.randomUUID()}`;
+  const membership = { id, userId, businessId, role, status: 'active', createdAt: new Date().toISOString() };
+  writeFileAtomic(path.join(DATA_DIR, 'business-users', safeFileName(id) + '.json'), JSON.stringify(membership, null, 2));
+  invalidateCache('business-users');
+  return membership;
+}
+
+function migrateLegacyData(businessId) {
+  for (const dir of TENANT_DIRS) {
+    const dirPath = path.join(DATA_DIR, dir);
+    if (!fs.existsSync(dirPath)) continue;
+    for (const file of fs.readdirSync(dirPath).filter(name => name.endsWith('.json'))) {
+      const filePath = path.join(dirPath, file);
+      const item = readJSON(filePath);
+      if (item && !item.businessId) writeFileAtomic(filePath, JSON.stringify({ ...item, businessId }, null, 2));
+    }
+    invalidateCache(dir);
+  }
+  const legacyPrefs = readJSON(LOCAL_PREFS_PATH, null);
+  const tenantPrefsPath = path.join(BUSINESS_META_DIR, safeFileName(businessId) + '-prefs.json');
+  if (legacyPrefs && !fs.existsSync(tenantPrefsPath)) writeFileAtomic(tenantPrefsPath, JSON.stringify(legacyPrefs, null, 2));
+}
+
+app.get('/api/auth/status', (req, res) => {
+  const users = readAllRawFromDir('users');
+  const auth = authFromRequest(req);
+  if (!auth) return res.json({ authenticated: false, needsSetup: users.length === 0 });
+  const memberships = authMemberships(auth.id);
+  res.json({ authenticated: true, needsSetup: false, user: auth, memberships, businesses: authBusinessesFor(auth.id) });
+});
+
+app.post('/api/auth/bootstrap', async (req, res) => {
+  if (readAllRawFromDir('users').length) return res.status(409).json({ error: 'An administrator already exists' });
+  const name = String(req.body?.name || '').trim();
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const password = String(req.body?.password || '');
+  const businessName = String(req.body?.businessName || '').trim();
+  if (!name || !email || !businessName || password.length < 8) return res.status(400).json({ error: 'Name, business name and a password of at least 8 characters are required' });
+  if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address' });
+  const user = { id: `usr_${crypto.randomUUID()}`, name, email, passwordHash: await hashPassword(password), role: 'platform-admin', createdAt: new Date().toISOString() };
+  const existingProfiles = readAllRawFromDir('profiles');
+  const business = existingProfiles[0] || { id: `biz_${crypto.randomUUID()}`, businessName };
+  business.id = business.id || `biz_${crypto.randomUUID()}`;
+  business.businessName = business.businessName || businessName;
+  writeFileAtomic(path.join(DATA_DIR, 'users', safeFileName(user.id) + '.json'), JSON.stringify(user, null, 2));
+  writeFileAtomic(path.join(DATA_DIR, 'profiles', safeFileName(business.id) + '.json'), JSON.stringify({ ...business, businessId: business.id }, null, 2));
+  addBusinessMembership(user.id, business.id, 'owner');
+  migrateLegacyData(business.id);
+  const token = encodeToken({ sub: user.id, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + AUTH_TOKEN_TTL_SECONDS });
+  res.status(201).json({ token, user: { id: user.id, name, email, role: user.role }, business });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const password = String(req.body?.password || '');
+  const user = readAllRawFromDir('users').find(item => item.email === email);
+  if (!user || !(await verifyPassword(password, user.passwordHash))) return res.status(401).json({ error: 'Email or password is incorrect' });
+  const memberships = authMemberships(user.id);
+  const token = encodeToken({ sub: user.id, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + AUTH_TOKEN_TTL_SECONDS });
+  res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role }, memberships, businesses: authBusinessesFor(user.id) });
+});
+
+// Every route below this line requires a bearer token and is scoped to the
+// selected business. Health/version/update checks remain public above/below.
+app.use('/api', (req, res, next) => {
+  const publicPath = ['/auth/status', '/auth/bootstrap', '/auth/login', '/health', '/version', '/check-update'];
+  if (publicPath.includes(req.path)) return next();
+  return requireAuth(req, res, next);
+});
 
 // ========================
 // BILLS
@@ -263,6 +455,7 @@ function findCreditDependents(billId) {
       let other;
       try { other = readJSON(path.join(billsDir, f), null); } catch { continue; }
       if (!other || other.id === billId) continue;
+      if (tenantContext.getStore()?.tenantId && other.businessId !== tenantContext.getStore().tenantId) continue;
       const payments = other.payments || other.data?.payments || [];
       for (const p of payments) {
         if (p?.mode !== 'credit-applied') continue;
@@ -286,6 +479,7 @@ app.delete('/api/bills/:id', (req, res) => {
   const fname = safeFileName(req.params.id) + '.json';
   const filePath = path.join(DATA_DIR, 'bills', fname);
   if (!fs.existsSync(filePath)) return res.json({ success: true });
+  if (!tenantOwnsFile(filePath)) return res.status(404).json({ error: 'Not found' });
 
   // v1.10.31 — Data-F9.1: client-credit dependency check. Blocks silent
   // deletion of a credit source that would leave a paid-via-credit target
@@ -329,11 +523,14 @@ const DEFAULT_PROFILE = {
 };
 
 app.get('/api/profile', (req, res) => {
-  res.json(readJSON(PROFILE_PATH, DEFAULT_PROFILE));
+  const profiles = readAllFromDir('profiles');
+  res.json(profiles.find(profile => profile.id === req.tenantId || profile.businessId === req.tenantId)
+    || { ...DEFAULT_PROFILE, businessId: req.tenantId, id: req.tenantId });
 });
 
 app.post('/api/profile', (req, res) => {
-  writeJSON(PROFILE_PATH, req.body);
+  const profile = { ...req.body, id: req.tenantId, businessId: req.tenantId };
+  writeJSON(path.join(DATA_DIR, 'profiles', safeFileName(req.tenantId) + '.json'), profile);
   res.json({ success: true });
 });
 
@@ -512,16 +709,29 @@ app.delete('/api/purchases/:id', (req, res) => {
 // BUSINESS PROFILES (multi-business)
 // ========================
 app.get('/api/profiles', (req, res) => {
-  const profiles = readAllFromDir('profiles');
+  const allowed = new Set(authMemberships(req.auth.id).map(member => member.businessId));
+  const profiles = readAllRawFromDir('profiles').filter(profile => allowed.has(profile.id) || allowed.has(profile.businessId));
   profiles.sort((a, b) => (a.businessName || '').localeCompare(b.businessName || ''));
   res.json(profiles);
 });
 
 app.post('/api/profiles', (req, res) => {
-  const prof = req.body;
-  if (!prof.id) prof.id = 'biz_' + Date.now();
+  const prof = { ...(req.body || {}) };
+  const existing = prof.id && readAllRawFromDir('profiles').find(item => item.id === prof.id);
+  if (existing && !authMemberships(req.auth.id).some(member => member.businessId === (existing.businessId || existing.id))) {
+    return res.status(403).json({ error: 'No access to this business' });
+  }
+  if (!prof.id) {
+    prof.id = 'biz_' + crypto.randomUUID();
+    prof.businessId = prof.id;
+    addBusinessMembership(req.auth.id, prof.id, 'owner');
+  } else if (!existing) {
+    prof.businessId = prof.id;
+    addBusinessMembership(req.auth.id, prof.id, 'owner');
+  }
   const filePath = path.join(DATA_DIR, 'profiles', safeFileName(prof.id) + '.json');
-  writeJSON(filePath, prof);
+  writeFileAtomic(filePath, JSON.stringify({ ...prof, businessId: prof.id }, null, 2));
+  invalidateCache('profiles');
   res.json({ success: true, id: prof.id });
 });
 
@@ -532,9 +742,107 @@ app.delete('/api/profiles/:id', (req, res) => {
 });
 
 // ========================
+// BUSINESS USERS (team access)
+// ========================
+// This is the first tenant-aware boundary for the SaaS migration. User
+// records are kept separate from business profiles so the UI can evolve from
+// local profiles to a proper users/business_users relationship later.
+app.get('/api/business-users', (req, res) => {
+  const businessId = String(req.query.businessId || '').trim();
+  if (!businessId) return res.status(400).json({ error: 'businessId is required' });
+  const requestedMembership = authMemberships(req.auth.id).find(member => member.businessId === businessId);
+  if (!requestedMembership) return res.status(403).json({ error: 'No access to this business' });
+  if (!['owner', 'admin'].includes(requestedMembership.role)) return res.status(403).json({ error: 'Only business admins can view team access' });
+  const users = readAllRawFromDir('business-users')
+    .filter(user => user.businessId === businessId)
+    .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  res.json(users);
+});
+
+app.post('/api/business-users', async (req, res) => {
+  if (!['owner', 'admin'].includes(req.membership?.role)) return res.status(403).json({ error: 'Only business admins can invite users' });
+  const input = req.body || {};
+  const businessId = String(input.businessId || '').trim();
+  const name = String(input.name || '').trim();
+  const email = String(input.email || '').trim().toLowerCase();
+  const password = String(input.password || '');
+  const role = String(input.role || 'staff').trim();
+  if (!businessId || !name || !email || password.length < 8) {
+    return res.status(400).json({ error: 'Business, name, email and a password of at least 8 characters are required' });
+  }
+  const businessMembership = authMemberships(req.auth.id).find(member => member.businessId === businessId);
+  if (!businessMembership || !['owner', 'admin'].includes(businessMembership.role)) return res.status(403).json({ error: 'Only business admins can invite users' });
+  if (!/^\S+@\S+\.\S+$/.test(email)) {
+    return res.status(400).json({ error: 'Enter a valid email address' });
+  }
+  if (!['owner', 'admin', 'staff'].includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+  const existing = readAllRawFromDir('business-users').find(user =>
+    user.businessId === businessId && user.email === email
+  );
+  if (existing) return res.status(409).json({ error: 'This email is already part of the business' });
+
+  const account = readAllRawFromDir('users').find(user => user.email === email) || {
+    id: 'usr_' + crypto.randomUUID(),
+    email,
+    name,
+    status: 'invited',
+    createdAt: new Date().toISOString(),
+  };
+  if (!account.name) account.name = name;
+  account.passwordHash = await hashPassword(password);
+  account.status = 'active';
+  if (!readAllRawFromDir('users').some(user => user.id === account.id)) {
+    writeFileAtomic(path.join(DATA_DIR, 'users', safeFileName(account.id) + '.json'), JSON.stringify(account, null, 2));
+  }
+  const user = {
+    id: 'bu_' + crypto.randomUUID(),
+    businessId,
+    userId: account.id,
+    name,
+    email,
+    role,
+    status: 'active',
+    createdAt: new Date().toISOString(),
+  };
+  writeFileAtomic(path.join(DATA_DIR, 'business-users', safeFileName(user.id) + '.json'), JSON.stringify(user, null, 2));
+  invalidateCache('business-users');
+  res.status(201).json(user);
+});
+
+app.patch('/api/business-users/:id', (req, res) => {
+  const filePath = path.join(DATA_DIR, 'business-users', safeFileName(req.params.id) + '.json');
+  const user = readJSON(filePath);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const membership = authMemberships(req.auth.id).find(item => item.businessId === user.businessId);
+  if (!membership || !['owner', 'admin'].includes(membership.role)) return res.status(403).json({ error: 'Only business admins can update team access' });
+  const next = { ...user };
+  if (req.body?.status && ['invited', 'active', 'suspended'].includes(req.body.status)) next.status = req.body.status;
+  if (req.body?.role && ['owner', 'admin', 'staff'].includes(req.body.role)) next.role = req.body.role;
+  writeFileAtomic(filePath, JSON.stringify({ ...next, businessId: user.businessId }, null, 2));
+  invalidateCache('business-users');
+  res.json(next);
+});
+
+app.delete('/api/business-users/:id', (req, res) => {
+  const filePath = path.join(DATA_DIR, 'business-users', safeFileName(req.params.id) + '.json');
+  const target = readJSON(filePath);
+  const membership = authMemberships(req.auth.id).find(item => item.businessId === target?.businessId);
+  if (!membership || !['owner', 'admin'].includes(membership.role)) return res.status(403).json({ error: 'Only business admins can remove team access' });
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'User not found' });
+  deleteFile(filePath);
+  res.json({ success: true });
+});
+
+// ========================
 // META (counters, etc.)
 // ========================
 const META_PATH = path.join(DATA_DIR, 'meta.json');
+function metaPathForRequest() {
+  const tenantId = tenantContext.getStore()?.tenantId;
+  return tenantId ? path.join(BUSINESS_META_DIR, safeFileName(tenantId) + '.json') : META_PATH;
+}
 
 // v1.10.77 (#84) - the PIN lock lives in meta.json too, but only the
 // /api/lock routes below may read or change it.
@@ -544,16 +852,17 @@ const withLock = (meta, lock) => (lock ? { ...withoutLock(meta), [LOCK_KEY]: loc
 
 app.get('/api/meta/:key', (req, res) => {
   if (req.params.key === LOCK_KEY) return errRes(res, 403, 'forbidden');
-  const meta = readJSON(META_PATH, {});
+  const meta = readJSON(metaPathForRequest(), {});
   res.json({ value: meta[req.params.key] ?? null });
 });
 
 app.post('/api/meta/:key', (req, res) => {
   if (req.params.key === LOCK_KEY) return errRes(res, 403, 'forbidden');
   if (!req.body || !('value' in req.body)) return errRes(res, 400, 'bad-request');
-  const meta = readJSON(META_PATH, {});
+  const metaPath = metaPathForRequest();
+  const meta = readJSON(metaPath, {});
   meta[req.params.key] = req.body.value;
-  writeJSON(META_PATH, meta);
+  writeJSON(metaPath, meta);
   res.json({ success: true });
 });
 
@@ -564,12 +873,13 @@ app.post('/api/meta/:key', (req, res) => {
 // "two saves both reading 5, both writing 6" duplicate-invoice-number bug.
 app.post('/api/meta/:key/increment', (req, res) => {
   if (req.params.key === LOCK_KEY) return errRes(res, 403, 'forbidden');
-  const meta = readJSON(META_PATH, {});
+  const metaPath = metaPathForRequest();
+  const meta = readJSON(metaPath, {});
   // v1.10.78 (#93) - a tax invoice sends its start ("Start numbering from");
   // see nextCounterValue. Nothing else jumps.
   const next = nextCounterValue(meta[req.params.key], req.body?.start);
   meta[req.params.key] = next;
-  writeJSON(META_PATH, meta);
+  writeJSON(metaPath, meta);
   res.json({ value: next });
 });
 
@@ -582,17 +892,22 @@ app.post('/api/meta/:key/increment', (req, res) => {
 // letterhead and signature image, and meta.json is rewritten on every new
 // invoice number. 25mb for those images; the server answers this PC only.
 const LOCAL_PREFS_PATH = path.join(DATA_DIR, 'local-prefs.json');
+function localPrefsPathForRequest() {
+  const tenantId = tenantContext.getStore()?.tenantId;
+  return tenantId ? path.join(BUSINESS_META_DIR, safeFileName(tenantId) + '-prefs.json') : LOCAL_PREFS_PATH;
+}
 app.get(LOCAL_PREFS_ROUTE, (req, res) => {
-  res.json({ value: readJSON(LOCAL_PREFS_PATH, {}) });
+  res.json({ value: readJSON(localPrefsPathForRequest(), {}) });
 });
 // { set: { key: string }, remove: [key] } - merged, never replaced wholesale.
 app.post(LOCAL_PREFS_ROUTE, express.json({ limit: '25mb' }), (req, res) => {
   const { set = {}, remove = [] } = req.body || {};
   if (!set || typeof set !== 'object' || Array.isArray(set) || !Array.isArray(remove)) return errRes(res, 400, 'bad-request');
-  const prefs = readJSON(LOCAL_PREFS_PATH, {});
+  const prefsPath = localPrefsPathForRequest();
+  const prefs = readJSON(prefsPath, {});
   for (const [k, v] of Object.entries(set)) if (typeof v === 'string') prefs[k] = v;
   for (const k of remove) delete prefs[String(k)];
-  writeJSON(LOCAL_PREFS_PATH, prefs);
+  writeFileAtomic(prefsPath, JSON.stringify(prefs, null, 2));
   return res.json({ success: true });
 });
 
@@ -617,10 +932,11 @@ const pinMatches = (lock, pin) => {
 // Five wrong PINs in a row -> wait 30 seconds before the next try.
 const pinTries = { wrong: 0, until: 0 };
 const currentLock = () => {
-  const meta = readJSON(META_PATH, {});
+  const metaPath = metaPathForRequest();
+  const meta = readJSON(metaPath, {});
   const reset = RESET_PIN_FILES.filter((f) => fs.existsSync(f));
   if (reset.length) {
-    if (meta[LOCK_KEY]) { delete meta[LOCK_KEY]; writeJSON(META_PATH, meta); }
+    if (meta[LOCK_KEY]) { delete meta[LOCK_KEY]; writeJSON(metaPath, meta); }
     for (const f of reset) { try { fs.unlinkSync(f); } catch { /* removed already */ } }
     console.log('[lock] RESET-PIN file found: PIN lock removed');
     return null;
@@ -657,13 +973,14 @@ app.post('/api/lock/set', (req, res) => {
   if (pin !== null && !PIN_RE.test(String(pin ?? ''))) return errRes(res, 400, 'bad-request');
   const lock = currentLock();
   if (lock && !checkPin(res, lock, currentPin)) return undefined;
-  const meta = readJSON(META_PATH, {});
+  const metaPath = metaPathForRequest();
+  const meta = readJSON(metaPath, {});
   if (pin === null) delete meta[LOCK_KEY];
   else {
     const salt = crypto.randomBytes(16).toString('hex');
     meta[LOCK_KEY] = { salt, hash: pinHash(pin, salt), length: String(pin).length };
   }
-  writeJSON(META_PATH, meta);
+  writeJSON(metaPath, meta);
   return res.json({ ok: true, enabled: pin !== null });
 });
 
@@ -673,7 +990,7 @@ app.post('/api/lock/set', (req, res) => {
 app.get('/api/export', (req, res) => {
   const data = {
     bills: readAllFromDir('bills'),
-    profile: readJSON(PROFILE_PATH, DEFAULT_PROFILE),
+    profile: readAllFromDir('profiles').find(profile => profile.id === req.tenantId || profile.businessId === req.tenantId) || { ...DEFAULT_PROFILE, id: req.tenantId, businessId: req.tenantId },
     clients: readAllFromDir('clients'),
     termsTemplates: readAllFromDir('templates'),
     products: readAllFromDir('products'),
@@ -683,7 +1000,7 @@ app.get('/api/export', (req, res) => {
     profiles: readAllFromDir('profiles'),
     purchases: readAllFromDir('purchases'),
     // v1.10.77 - never the PIN hash: a backup file can travel (email, Drive).
-    meta: withoutLock(readJSON(META_PATH, {})),
+    meta: withoutLock(readJSON(metaPathForRequest(), {})),
     exportedAt: new Date().toISOString(),
   };
   res.json(data);
@@ -724,10 +1041,12 @@ app.post('/api/import', (req, res) => {
     counts[countKey]++;
   };
 
-  // Profile is a singleton (single file); overwrite-gated same way.
+  // Profile is scoped to the authenticated business; never write the legacy
+  // global profile file from an authenticated request.
   if (data.profile) {
-    if (overwrite || !fs.existsSync(PROFILE_PATH)) {
-      writeJSON(PROFILE_PATH, data.profile);
+    const profilePath = path.join(DATA_DIR, 'profiles', safeFileName(req.tenantId) + '.json');
+    if (overwrite || !fs.existsSync(profilePath)) {
+      writeJSON(profilePath, { ...data.profile, id: req.tenantId, businessId: req.tenantId });
     }
   }
   (data.bills || []).forEach(b => upsertOne('bills', b, 'billCount', 'billSkipped'));
@@ -743,20 +1062,21 @@ app.post('/api/import', (req, res) => {
   // meta.json — same gating. Previously always overwrote → counters could
   // regress below existing bill numbers → collision loop on next save.
   if (data.meta) {
-    if (overwrite || !fs.existsSync(META_PATH)) {
+    const metaPath = metaPathForRequest();
+    if (overwrite || !fs.existsSync(metaPath)) {
       // The PIN on this PC stays as it is: a backup never sets, removes or
       // brings back an old PIN.
-      writeJSON(META_PATH, withLock(withoutLock(data.meta), readJSON(META_PATH, {})[LOCK_KEY]));
+      writeJSON(metaPath, withLock(withoutLock(data.meta), readJSON(metaPath, {})[LOCK_KEY]));
     } else {
       // v1.10.79 (#95) - a merge keeps what is here and adds the backup's own
       // number series and the higher of each counter, so no number is reused.
-      const meta = readJSON(META_PATH, {});
+      const meta = readJSON(metaPath, {});
       const series = { ...(data.meta.invoiceNumberSeries || {}), ...(meta.invoiceNumberSeries || {}) };
       if (Object.keys(series).length) meta.invoiceNumberSeries = series;
       for (const [k, v] of Object.entries(data.meta)) {
         if (k.startsWith('counter_') && Number(v) > (Number(meta[k]) || 0)) meta[k] = Number(v);
       }
-      writeJSON(META_PATH, meta);
+      writeJSON(metaPath, meta);
     }
   }
 
@@ -765,13 +1085,12 @@ app.post('/api/import', (req, res) => {
   // suffix from its invoice number. Bump each `counter_<PREFIX>` in meta
   // to at least max(existing) so the next reservation doesn't collide.
   try {
-    const meta = readJSON(META_PATH, {});
-    const billFiles = fs.readdirSync(path.join(DATA_DIR, 'bills')).filter(f => f.endsWith('.json'));
+    const metaPath = metaPathForRequest();
+    const meta = readJSON(metaPath, {});
+    const scopedBills = readAllFromDir('bills');
     const maxByPrefix = {};
     const maxByKey = {};
-    for (const f of billFiles) {
-      let bill;
-      try { bill = readJSON(path.join(DATA_DIR, 'bills', f), null); } catch { continue; }
+    for (const bill of scopedBills) {
       const num = String(bill?.invoiceNumber || bill?.id || '');
       // Extract prefix + last numeric suffix (e.g. INV/2026-27/0007 → prefix INV, suffix 7)
       const m = num.match(/^([A-Z]+)[\W_].*?(\d+)\s*$/i);
@@ -805,7 +1124,7 @@ app.post('/api/import', (req, res) => {
         metaChanged = true;
       }
     }
-    if (metaChanged) writeJSON(META_PATH, meta);
+    if (metaChanged) writeJSON(metaPath, meta);
   } catch (err) {
     console.error('Post-import counter reconciliation failed:', err);
   }
@@ -863,7 +1182,8 @@ app.post('/api/save-pdf', express.raw({ type: 'application/pdf', limit: '20mb' }
 app.post('/api/number-series/rename', (req, res) => {
   const { from, to } = req.body || {};
   if (!from || !to || typeof from !== 'string' || typeof to !== 'string' || from === to) return errRes(res, 400, 'bad-request');
-  const meta = readJSON(META_PATH, {});
+  const metaPath = metaPathForRequest();
+  const meta = readJSON(metaPath, {});
   const series = meta.invoiceNumberSeries || {};
   if (!series[from] || series[to]) return res.json({ moved: false });
   series[to] = series[from];
@@ -876,7 +1196,7 @@ app.post('/api/number-series/rename', (req, res) => {
       delete meta[key];
     }
   }
-  writeJSON(META_PATH, meta);
+  writeJSON(metaPath, meta);
   return res.json({ moved: true });
 });
 
@@ -1311,7 +1631,7 @@ const BACKUP_FOLDER_KEY = 'backupFolder';
 const EXTRA_BACKUP_SUBDIR = 'FreeGSTBill Backups';
 const DATE_DIR = /^\d{4}-\d{2}-\d{2}$/;
 const extraBackupsDir = () => {
-  const folder = readJSON(META_PATH, {})[BACKUP_FOLDER_KEY];
+  const folder = readJSON(metaPathForRequest(), {})[BACKUP_FOLDER_KEY];
   return typeof folder === 'string' && folder.trim() && path.isAbsolute(folder.trim())
     ? path.join(folder.trim(), EXTRA_BACKUP_SUBDIR) : null;
 };
@@ -1322,10 +1642,10 @@ let lastExtraBackupError = '';
 // each other's dates silently, so one PC was never backed up and a restore
 // could bring back the other PC's books. Now that is reported instead.
 const installId = () => {
-  const meta = readJSON(META_PATH, {});
+  const meta = readJSON(metaPathForRequest(), {});
   if (typeof meta.installId === 'string' && meta.installId) return meta.installId;
   const id = crypto.randomUUID();
-  writeJSON(META_PATH, { ...meta, installId: id });
+  writeJSON(metaPathForRequest(), { ...meta, installId: id });
   return id;
 };
 const exists = (p) => fs.promises.access(p).then(() => true, () => false);
@@ -1498,8 +1818,8 @@ app.post('/api/backups/:date/restore', (req, res) => {
 
     // The PIN on this PC survives the restore (see withLock), and so does the
     // backup folder setting (the backup may be older than it).
-    const lockBefore = readJSON(META_PATH, {})[LOCK_KEY];
-    const backupFolderBefore = readJSON(META_PATH, {})[BACKUP_FOLDER_KEY];
+    const lockBefore = readJSON(metaPathForRequest(), {})[LOCK_KEY];
+    const backupFolderBefore = readJSON(metaPathForRequest(), {})[BACKUP_FOLDER_KEY];
 
     // Make a snapshot of live data before touching anything.
     snapshotDir = path.join(BACKUPS_DIR, `pre-restore-${Date.now()}`);
@@ -1529,10 +1849,10 @@ app.post('/api/backups/:date/restore', (req, res) => {
       restoredDirs.push(entry.name);
     }
     {
-      const restoredMeta = withLock(readJSON(META_PATH, {}), lockBefore);
+      const restoredMeta = withLock(readJSON(metaPathForRequest(), {}), lockBefore);
       if (backupFolderBefore) restoredMeta[BACKUP_FOLDER_KEY] = backupFolderBefore;
       else delete restoredMeta[BACKUP_FOLDER_KEY];
-      writeJSON(META_PATH, restoredMeta);
+      writeJSON(metaPathForRequest(), restoredMeta);
     }
     for (const dir of DIRS) invalidateCache(dir);
 
@@ -1577,15 +1897,15 @@ app.post('/api/backups/:date/restore', (req, res) => {
 // the last copy worked; POST { path } sets it ('' turns it off). The folder
 // is created and test-written before it is accepted.
 app.get('/api/backup-folder', (req, res) => {
-  const folder = readJSON(META_PATH, {})[BACKUP_FOLDER_KEY] || '';
+  const folder = readJSON(metaPathForRequest(), {})[BACKUP_FOLDER_KEY] || '';
   res.json({ path: folder, copiesIn: extraBackupsDir(), error: lastExtraBackupError });
 });
 app.post('/api/backup-folder', async (req, res) => {
   const raw = String(req.body?.path ?? '').trim();
-  const meta = readJSON(META_PATH, {});
+  const meta = readJSON(metaPathForRequest(), {});
   if (!raw) {
     delete meta[BACKUP_FOLDER_KEY];
-    writeJSON(META_PATH, meta);
+    writeJSON(metaPathForRequest(), meta);
     lastExtraBackupError = '';
     return res.json({ ok: true, path: '' });
   }
@@ -1601,7 +1921,7 @@ app.post('/api/backup-folder', async (req, res) => {
     return res.status(400).json({ ok: false, error: `Cannot write to that folder: ${err.code || err.message}` });
   }
   meta[BACKUP_FOLDER_KEY] = raw;
-  writeJSON(META_PATH, meta);
+  writeJSON(metaPathForRequest(), meta);
   await runDailyBackup(); // copies today's backup there now
   return res.json({ ok: !lastExtraBackupError, path: raw, copiesIn: dir, error: lastExtraBackupError });
 });
@@ -1629,6 +1949,7 @@ app.get('/api/trash', (req, res) => {
         try {
           const p = path.join(BILL_TRASH_DIR, name);
           const bill = readJSON(p, null);
+          if (tenantContext.getStore()?.tenantId && bill?.businessId !== tenantContext.getStore().tenantId) return null;
           const stat = fs.statSync(p);
           return bill ? { ...bill, _trashedAt: stat.mtime.toISOString() } : null;
         } catch { return null; }
@@ -1644,6 +1965,7 @@ app.post('/api/trash/:id/restore', (req, res) => {
     const trashPath = path.join(BILL_TRASH_DIR, fname);
     const billsPath = path.join(DATA_DIR, 'bills', fname);
     if (!fs.existsSync(trashPath)) return res.status(404).json({ error: 'Not in trash' });
+    if (!tenantOwnsFile(trashPath)) return res.status(404).json({ error: 'Not in trash' });
     // A new bill may have taken this number since: never replace it.
     if (fs.existsSync(billsPath)) return res.status(409).json({ error: 'An invoice with this number exists again. Rename or delete it first.' });
     fs.renameSync(trashPath, billsPath);
@@ -1656,6 +1978,7 @@ app.delete('/api/trash/:id', (req, res) => {
   try {
     const fname = safeFileName(req.params.id) + '.json';
     const trashPath = path.join(BILL_TRASH_DIR, fname);
+    if (fs.existsSync(trashPath) && !tenantOwnsFile(trashPath)) return res.status(404).json({ error: 'Not in trash' });
     if (fs.existsSync(trashPath)) fs.unlinkSync(trashPath);
     res.json({ success: true });
   } catch (err) { errRes(res, 500, 'server-error', err); }
@@ -1927,12 +2250,13 @@ function nextInvoiceNumber(prefix, invoiceType = 'tax-invoice', businessKey = ''
   // The same rules as the app's getNextInvoiceNumber (src/utils.js): the
   // business's own series when it has one (v1.10.79, #95), else the shared
   // one; atomic counter in meta; brand-TYPE prefixes; India's FY label.
-  const meta = readJSON(META_PATH, {});
+  const metaPath = metaPathForRequest();
+  const meta = readJSON(metaPath, {});
   const series = numberSeriesFor(meta.invoiceNumberSettings, meta.invoiceNumberSeries, businessKey);
   const key = counterKeyFor(prefix, series, businessKey);
   const next = nextCounterValue(meta[key], startFor(invoiceType, series));
   meta[key] = next;
-  writeJSON(META_PATH, meta);
+  writeJSON(metaPath, meta);
   return formatDocNumber({ settings: series, typePrefix: prefix, next, fyLabel: getFinancialYearLabel() });
 }
 
@@ -1967,7 +2291,7 @@ function generateFromTemplate(tpl, today) {
       let profile = profiles.find(p => p.gstin && tpl.ownerGstin && p.gstin === tpl.ownerGstin)
                  || profiles.find(p => p.id && tpl.profileId && p.id === tpl.profileId)
                  || profiles.find(p => p.businessName && p.businessName === (tpl.profileBusinessName || tpl.ownerName))
-                 || readJSON(PROFILE_PATH, {});
+                 || {};
 
       const prefix = (tpl.invoiceType === 'proforma' ? 'EST'
                    : tpl.invoiceType === 'quotation' ? 'QUO'
@@ -2072,7 +2396,8 @@ async function processDueRecurring() {
     if (!tpl.nextDate || tpl.nextDate > today) continue;
     if (templateHasEnded(tpl, today)) continue;
     try {
-      generateFromTemplate(tpl, today);
+      if (!tpl.businessId) throw new Error('Recurring template has no business owner');
+      tenantContext.run({ tenantId: tpl.businessId, auth: null }, () => generateFromTemplate(tpl, today));
       fired += 1;
     } catch (err) {
       logFatal(err, 'recurring');

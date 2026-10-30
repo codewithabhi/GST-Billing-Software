@@ -6,9 +6,16 @@ import { getFinancialYearLabel, parseLocalDate, nextCounterValue, startFor, numb
 const API = '/api';
 
 async function apiFetch(url, options = {}) {
+  const token = (() => { try { return localStorage.getItem('gst_auth_token') || ''; } catch { return ''; } })();
+  const businessId = (() => { try { return localStorage.getItem('gst_activeBusinessId') || ''; } catch { return ''; } })();
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(businessId ? { 'X-Business-Id': businessId } : {}),
+      ...(options.headers || {}),
+    },
   });
   if (!res.ok) {
     // Preserve server-provided error message (used e.g. for 409 duplicate
@@ -22,6 +29,11 @@ async function apiFetch(url, options = {}) {
   }
   return res.json();
 }
+
+// ---- SaaS authentication ----
+export const getAuthStatus = () => apiFetch(`${API}/auth/status`);
+export const bootstrapAuth = (payload) => apiFetch(`${API}/auth/bootstrap`, { method: 'POST', body: JSON.stringify(payload) });
+export const loginAuth = (payload) => apiFetch(`${API}/auth/login`, { method: 'POST', body: JSON.stringify(payload) });
 
 // ---- PIN lock (v1.10.77, #84; checked by the server, see AppLock.jsx) ----
 export const getLockStatus = () => apiFetch(`${API}/lock`);
@@ -371,6 +383,30 @@ export const saveBusinessProfile = async (profile) => {
 
 export const deleteBusinessProfile = async (id) => {
   return apiFetch(`${API}/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' });
+};
+
+// ---- Business users / team access ----
+export const getBusinessUsers = async (businessId) => {
+  if (!businessId) return [];
+  return apiFetch(`${API}/business-users?businessId=${encodeURIComponent(businessId)}`);
+};
+
+export const createBusinessUser = async (user) => {
+  return apiFetch(`${API}/business-users`, {
+    method: 'POST',
+    body: JSON.stringify(user),
+  });
+};
+
+export const updateBusinessUser = async (id, changes) => {
+  return apiFetch(`${API}/business-users/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(changes),
+  });
+};
+
+export const deleteBusinessUser = async (id) => {
+  return apiFetch(`${API}/business-users/${encodeURIComponent(id)}`, { method: 'DELETE' });
 };
 
 // ---- Export / Import ----
